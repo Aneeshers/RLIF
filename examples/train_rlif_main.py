@@ -62,6 +62,31 @@ FLAGS_DEF = define_flags_with_default(
     checkpoint_buffer=False,
     utd_ratio=1,
     binary_include_bc=True,
+
+    # --- Reward / baseline-mode switches (added for RLPD+demos baseline) ---
+    # rlif_mode=True  -> original RLIF reward scheme: task reward is ZEROED and a
+    #                    -1 penalty is written at the rising edge of an intervention.
+    # rlif_mode=False -> standard RLPD reward: keep the ORIGINAL task reward on both
+    #                    demos (prior buffer) and online transitions; NO -1 labeling.
+    rlif_mode=True,
+    # use_intervention=True  -> expert can take over (RLIF / RLPD+demos+intervention).
+    # use_intervention=False -> agent acts entirely on its own (pure RLPD+demos
+    #                    baseline); no expert/ground-truth checkpoints are loaded.
+    use_intervention=True,
+
+    # --- cosw (CAGE cosine-alignment correction) ---------------------------
+    # cosw=True adds the critic-side term -cos(a_E - a_L, grad_a Qbar(s,a_L))
+    # (optionally ||a_E - a_L||-weighted) using the expert MEAN action a_E.
+    # Requires the expert checkpoint (loaded whenever use_intervention OR cosw).
+    cosw=False,
+    cosw_coef=1.0,
+    cosw_weight_delta=True,
+
+    # seed_replay_with_demos=True (default) preserves original RLIF behavior:
+    # the demo / d4rl dataset is inserted into the ONLINE replay buffer at start.
+    # Set False for the clean factorial so the online buffer starts EMPTY and the
+    # "demos" axis is carried purely by offline_ratio (ds = d4rl prior, RLPD-style).
+    seed_replay_with_demos=True,
     )
 
 
@@ -128,40 +153,60 @@ def main(_):
 
     sparse_eval_sampler = TrajSampler(GymnasiumWrapper(gymnasium.make(FLAGS.sparse_env).unwrapped), FLAGS.max_traj_length)
 
-    # load agents
-    expert_model_pkl_dir = FLAGS.expert_dir
-    if 'iql' in expert_model_pkl_dir:
-        saved_ckpt_expert = load_model(expert_model_pkl_dir)
-        intervene_policy = get_iql_policy_from_model(eval_env, saved_ckpt_expert)
-    elif 'rlpd' in expert_model_pkl_dir:
-        saved_ckpt_expert = load_model(expert_model_pkl_dir)
-        intervene_policy = get_rlpd_policy_from_model(eval_env, saved_ckpt_expert)
-    else:
-        saved_ckpt_expert = load_model(expert_model_pkl_dir)
-        intervene_policy = get_policy_from_model(eval_env, saved_ckpt_expert)
-    
-    if FLAGS.ground_truth_agent_dir != '':
-        if 'iql' in FLAGS.ground_truth_agent_dir:
-            ground_truth_agent = load_model(FLAGS.ground_truth_agent_dir)['iql']
-            ground_truth_policy = IQLSamplerPolicy(ground_truth_agent.actor)
-            ground_truth_agent_type = 'iql'
-        elif 'sac' in FLAGS.ground_truth_agent_dir or 'bc' in FLAGS.ground_truth_agent_dir:
-            ground_truth_agent = load_model(FLAGS.ground_truth_agent_dir)['sac']
-            ground_truth_policy = SamplerPolicy(ground_truth_agent.policy, ground_truth_agent.train_params['policy'])
-            ground_truth_agent_type = 'sac'
-        elif 'rlpd' in FLAGS.ground_truth_agent_dir:
-            ground_truth_agent = load_model(FLAGS.ground_truth_agent_dir)['rlpd']
-            ground_truth_policy = RLPDSamplerPolicy(ground_truth_agent.actor)
-            ground_truth_agent_type = 'rlpd'
+    # load agents (expert takeover policy + ground-truth critic).
+    # Only needed when interventions are active. A pure RLPD+demos baseline
+    # (use_intervention=False) requires NO expert/ground-truth checkpoint.
+    # cosw needs the expert MEAN action -> load the expert whenever interventions
+    # OR cosw are enabled. For cosw we keep a handle to the raw RLPD expert agent
+    # (its .eval_actions gives the deterministic mean used for a_E).
+    cosw_expert_agent = None
+    if FLAGS.use_intervention or FLAGS.cosw:
+        expert_model_pkl_dir = FLAGS.expert_dir
+        if 'iql' in expert_model_pkl_dir:
+            saved_ckpt_expert = load_model(expert_model_pkl_dir)
+            intervene_policy = get_iql_policy_from_model(eval_env, saved_ckpt_expert)
+        elif 'rlpd' in expert_model_pkl_dir:
+            saved_ckpt_expert = load_model(expert_model_pkl_dir)
+            intervene_policy = get_rlpd_policy_from_model(eval_env, saved_ckpt_expert)
+            if FLAGS.cosw:
+                cosw_expert_agent = saved_ckpt_expert['rlpd']
         else:
-            raise ValueError("agent type not supported") 
+            saved_ckpt_expert = load_model(expert_model_pkl_dir)
+            intervene_policy = get_policy_from_model(eval_env, saved_ckpt_expert)
+        if FLAGS.cosw and cosw_expert_agent is None:
+            raise ValueError("cosw currently requires an 'rlpd' expert checkpoint (for eval mean actions).")
+
+        if FLAGS.ground_truth_agent_dir != '':
+            if 'iql' in FLAGS.ground_truth_agent_dir:
+                ground_truth_agent = load_model(FLAGS.ground_truth_agent_dir)['iql']
+                ground_truth_policy = IQLSamplerPolicy(ground_truth_agent.actor)
+                ground_truth_agent_type = 'iql'
+            elif 'sac' in FLAGS.ground_truth_agent_dir or 'bc' in FLAGS.ground_truth_agent_dir:
+                ground_truth_agent = load_model(FLAGS.ground_truth_agent_dir)['sac']
+                ground_truth_policy = SamplerPolicy(ground_truth_agent.policy, ground_truth_agent.train_params['policy'])
+                ground_truth_agent_type = 'sac'
+            elif 'rlpd' in FLAGS.ground_truth_agent_dir:
+                ground_truth_agent = load_model(FLAGS.ground_truth_agent_dir)['rlpd']
+                ground_truth_policy = RLPDSamplerPolicy(ground_truth_agent.actor)
+                ground_truth_agent_type = 'rlpd'
+            else:
+                raise ValueError("agent type not supported")
+        else:
+            ground_truth_agent = FLAGS.ground_truth_agent_dir
+            ground_truth_agent_type = ''
     else:
-        ground_truth_agent = FLAGS.ground_truth_agent_dir
+        # pure RLPD+demos baseline: no expert/ground-truth needed.
+        intervene_policy = None
+        ground_truth_policy = None
+        ground_truth_agent = ''
         ground_truth_agent_type = ''
 
 
     kwargs = dict(FLAGS.config)
     model_cls = kwargs.pop("model_cls")
+    kwargs["cosw"] = FLAGS.cosw
+    kwargs["cosw_coef"] = FLAGS.cosw_coef
+    kwargs["cosw_weight_delta"] = FLAGS.cosw_weight_delta
     agent = globals()[model_cls].create(
         FLAGS.seed, env.observation_space, env.action_space, **kwargs
     )
@@ -173,7 +218,10 @@ def main(_):
         dataset = get_d4rl_dataset(env)
 
     dataset['actions'] = np.clip(dataset['actions'], -0.999, 0.999)
-    dataset['rewards'] = np.zeros_like(dataset['rewards'])
+    # RLIF zeroes the demo (prior-buffer) task reward; a standard RLPD+demos
+    # baseline keeps the ORIGINAL task rewards.
+    if FLAGS.rlif_mode:
+        dataset['rewards'] = np.zeros_like(dataset['rewards'])
     dataset['masks'] = 1 - dataset['dones']
 
     replay_buffer = ReplayBuffer(
@@ -181,17 +229,21 @@ def main(_):
     )
     replay_buffer.seed(FLAGS.seed)
 
-    for i in range(len(dataset['rewards'])):
-        replay_buffer.insert(
-            dict(
-                observations=dataset['observations'][i],
-                actions=dataset['actions'][i],
-                rewards=0,
-                masks=dataset['masks'][i],
-                dones=dataset['dones'][i],
-                next_observations=dataset['next_observations'][i],
+    # seed_replay_with_demos=False -> online buffer starts EMPTY (clean factorial:
+    # the "demos" axis is carried by offline_ratio via ds, not by pre-seeding).
+    if FLAGS.seed_replay_with_demos:
+        for i in range(len(dataset['rewards'])):
+            replay_buffer.insert(
+                dict(
+                    observations=dataset['observations'][i],
+                    actions=dataset['actions'][i],
+                    # RLIF: reward 0; RLPD+demos baseline: keep original demo reward.
+                    rewards=0 if FLAGS.rlif_mode else dataset['rewards'][i],
+                    masks=dataset['masks'][i],
+                    dones=dataset['dones'][i],
+                    next_observations=dataset['next_observations'][i],
+                )
             )
-        )
     
 
     for i in tqdm.tqdm(
@@ -247,15 +299,21 @@ def main(_):
         
         policy_action, agent = agent.sample_actions(observation)
 
-        expert_action = intervene_policy(observation.reshape(1, -1), deterministic=False).reshape(-1)
-        ground_truth_action = ground_truth_policy(observation.reshape(1, -1), deterministic=False).reshape(-1)
+        if FLAGS.use_intervention:
+            expert_action = intervene_policy(observation.reshape(1, -1), deterministic=False).reshape(-1)
+            ground_truth_action = ground_truth_policy(observation.reshape(1, -1), deterministic=False).reshape(-1)
 
-        if 'ref' in FLAGS.intervention_strategy:
-            reference_action = expert_action
+            if 'ref' in FLAGS.intervention_strategy:
+                reference_action = expert_action
+            else:
+                reference_action = ground_truth_action
         else:
-            reference_action = ground_truth_action
+            # pure RLPD+demos baseline: agent always acts on its own.
+            expert_action = policy_action
+            ground_truth_action = policy_action
+            reference_action = policy_action
 
-        if not intervene:
+        if FLAGS.use_intervention and not intervene:
             if ground_truth_agent_type == 'iql':
                 gt_q1, gt_q2 = ground_truth_agent.critic(observation, reference_action)
                 gt_q = np.min([gt_q1, gt_q2])
@@ -310,8 +368,10 @@ def main(_):
                 replay_buffer.insert(
                    dict(
                         observations=all_observations[-1],
+                        # RLIF: -1 penalty at the intervention rising edge.
+                        # RLPD+demos baseline: keep the real task reward (no -1 label).
+                        rewards=-1 if FLAGS.rlif_mode else all_rewards[-1],
                         actions=all_actions[-1],
-                        rewards=-1,
                         masks=all_masks[-1],
                         dones=all_dones[-1],
                         next_observations=all_next_observations[-1],
@@ -329,14 +389,16 @@ def main(_):
                    dict(
                         observations=all_observations[-1],
                         actions=all_actions[-1],
-                        rewards=0,
+                        # RLIF: reward 0 on non-intervention steps.
+                        # RLPD+demos baseline: keep the real task reward.
+                        rewards=0 if FLAGS.rlif_mode else all_rewards[-1],
                         masks=all_masks[-1],
                         dones=all_dones[-1],
                         next_observations=all_next_observations[-1],
                     )
                 )
 
-        next_observation, _, done, info = env.step(action)
+        next_observation, reward, done, info = env.step(action)
 
         if not done or "TimeLimit.truncated" in info:
             mask = 1.0
@@ -346,7 +408,9 @@ def main(_):
         prev_intervene = intervene
         all_observations += [observation]
         all_actions += [action]
-        all_rewards += [0]
+        # store the REAL env reward so the RLPD+demos baseline can use it; RLIF
+        # mode ignores this and writes 0 / -1 at insertion time.
+        all_rewards += [reward]
         all_masks += [mask]
         all_dones += [done]
         all_next_observations += [next_observation]
@@ -357,6 +421,26 @@ def main(_):
         observation = next_observation
 
         if done or t > FLAGS.max_traj_length:
+            # ---- TERMINAL-FLUSH FIX -------------------------------------------
+            # The off-by-one insert (insert all_*[-1] at the TOP of the next
+            # iteration, gated by `t != 0`) DROPS the final transition of every
+            # episode: after this reset, t==0, so the just-appended terminal
+            # transition is never inserted. For the dense-reward RLPD baseline
+            # that starves the critic of mask=0 (true-termination) signal, so Q
+            # saturates at ~r/(1-gamma) and the policy collapses. Flush the final
+            # transition here (real reward, correct mask) so terminals are seen.
+            if not FLAGS.rlif_mode and len(all_observations) > 0:
+                replay_buffer.insert(
+                    dict(
+                        observations=all_observations[-1],
+                        actions=all_actions[-1],
+                        rewards=all_rewards[-1],
+                        masks=all_masks[-1],
+                        dones=all_dones[-1],
+                        next_observations=all_next_observations[-1],
+                    )
+                )
+            # -------------------------------------------------------------------
             observation, done = env.reset(), False
             intervene = False
             prev_intervene = False
@@ -369,6 +453,14 @@ def main(_):
             except:
                 pass
 
+        # Warmup guard: when the online buffer isn't pre-seeded (seed_replay_with_demos
+        # =False), wait until it has filled to start_training before updating, so we
+        # never sample an empty buffer. start_training=0 (default) => original behavior.
+        if i < FLAGS.start_training:
+            if i % FLAGS.log_interval == 0:
+                wandb.log({f"training/warmup": 1.0}, step=i + FLAGS.pretrain_steps)
+            continue
+
         online_batch = replay_buffer.sample(
             int(FLAGS.batch_size * FLAGS.utd_ratio * (1 - FLAGS.offline_ratio))
         )
@@ -380,6 +472,14 @@ def main(_):
 
         if "antmaze" in FLAGS.env_name:
             batch["rewards"] -= 1
+
+        # cosw: label every batch state with the expert MEAN action a_E. The critic
+        # alignment term (agents/rlpd.py:update_critic) consumes batch["expert_actions"].
+        if FLAGS.cosw:
+            expert_actions = cosw_expert_agent.eval_actions(batch["observations"])
+            batch["expert_actions"] = np.clip(
+                np.asarray(expert_actions), -0.999, 0.999
+            ).astype(np.float32)
 
         agent, update_info = agent.update(batch, FLAGS.utd_ratio)
 
