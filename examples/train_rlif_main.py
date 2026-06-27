@@ -60,6 +60,15 @@ FLAGS_DEF = define_flags_with_default(
     save_model=False,
     checkpoint_model=False,
     checkpoint_buffer=False,
+    # --- preemption-resilient auto-resume -----------------------------------
+    # resume=True: on (re)start, if a checkpoint already exists in this run's deterministic
+    # chkpt_dir (log_dir/<exp_prefix>/{online_ckpt,checkpoints}), restore the agent + recover the
+    # env-step counter and CONTINUE the online loop from there (x-axis continuity preserved). The
+    # replay buffer is restored too when checkpoint_buffer wrote one. Requires checkpoint_model.
+    resume=True,
+    # number of COARSE flax milestones kept (checkpoints/); an additional frequently-OVERWRITTEN
+    # online_ckpt/ checkpoint (keep=1) is saved every eval_interval for cheap resume.
+    num_coarse_checkpoints=4,
     utd_ratio=1,
     binary_include_bc=True,
 
@@ -129,8 +138,10 @@ def main(_):
     log_dir = os.path.join(FLAGS.log_dir, exp_prefix)
 
     if FLAGS.checkpoint_model:
-        chkpt_dir = os.path.join(log_dir, "checkpoints")
+        chkpt_dir = os.path.join(log_dir, "checkpoints")          # COARSE milestones (keep a few)
         os.makedirs(chkpt_dir, exist_ok=True)
+        online_chkpt_dir = os.path.join(log_dir, "online_ckpt")   # frequently OVERWRITTEN (keep=1)
+        os.makedirs(online_chkpt_dir, exist_ok=True)
 
     if FLAGS.checkpoint_buffer:
         buffer_dir = os.path.join(log_dir, "buffers")
@@ -246,8 +257,39 @@ def main(_):
             )
     
 
+    # --- preemption-resilient resume: restore the agent + env-step counter from the newest of the
+    # {online_ckpt, checkpoints} flax checkpoints (deterministic chkpt_dir => survives requeue). When
+    # resuming we SKIP the pretrain phase (already baked into the restored agent) and continue the
+    # online loop from resume_step so the wandb x-axis (env-steps) stays continuous. ---
+    resume_step = 0
+    if FLAGS.checkpoint_model and FLAGS.resume:
+        def _latest_step(d):
+            try:
+                p = checkpoints.latest_checkpoint(d)
+                return (int(str(p).split("_")[-1]), p) if p else (None, None)
+            except Exception:
+                return (None, None)
+        cands = [c for c in (_latest_step(online_chkpt_dir), _latest_step(chkpt_dir))
+                 if c[0] is not None]
+        if cands:
+            resume_step, best_path = max(cands, key=lambda x: x[0])
+            agent = checkpoints.restore_checkpoint(best_path, agent)
+            print(f"[rlif] RESUMED agent from {best_path} (env-step {resume_step})", flush=True)
+            if FLAGS.checkpoint_buffer:
+                bpath = os.path.join(buffer_dir, "buffer")
+                if os.path.exists(bpath):
+                    try:
+                        with open(bpath, "rb") as f:
+                            replay_buffer = pickle.load(f)
+                        print(f"[rlif] restored replay buffer from {bpath}", flush=True)
+                    except Exception as e:
+                        print(f"[rlif] buffer restore failed ({e}); continuing fresh buffer", flush=True)
+        else:
+            print("[rlif] resume=True but no checkpoint found; fresh start", flush=True)
+
+    pretrain_range = range(0, FLAGS.pretrain_steps) if resume_step == 0 else range(0)
     for i in tqdm.tqdm(
-        range(0, FLAGS.pretrain_steps), smoothing=0.1, disable=not FLAGS.tqdm
+        pretrain_range, smoothing=0.1, disable=not FLAGS.tqdm
     ):
         offline_batch = ds.sample(FLAGS.batch_size * FLAGS.utd_ratio)
         batch = {}
@@ -294,9 +336,9 @@ def main(_):
     stop_intervene_time = -1
     first_intervene_action_mask = []
     for i in tqdm.tqdm(
-        range(1, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
+        range(resume_step + 1, FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm
     ):
-        
+
         policy_action, agent = agent.sample_actions(observation)
 
         if FLAGS.use_intervention:
@@ -513,11 +555,22 @@ def main(_):
 
             if FLAGS.checkpoint_model:
                 try:
+                    # frequently-OVERWRITTEN online checkpoint (keep=1) for cheap preempt-resume
                     checkpoints.save_checkpoint(
-                        chkpt_dir, agent, step=i, keep=20, overwrite=True
+                        online_chkpt_dir, agent, step=i, keep=1, overwrite=True
                     )
-                except:
-                    print("Could not save model checkpoint.")
+                    # COARSE milestones (record/render): land on ~num_coarse_checkpoints boundaries
+                    n_coarse = max(FLAGS.num_coarse_checkpoints, 1)
+                    coarse_interval = max(
+                        FLAGS.eval_interval,
+                        (FLAGS.max_steps // n_coarse) // FLAGS.eval_interval * FLAGS.eval_interval,
+                    )
+                    if i % coarse_interval == 0 or i >= FLAGS.max_steps:
+                        checkpoints.save_checkpoint(
+                            chkpt_dir, agent, step=i, keep=n_coarse, overwrite=True
+                        )
+                except Exception as e:
+                    print(f"Could not save model checkpoint: {e}")
 
             if FLAGS.checkpoint_buffer:
                 try:
