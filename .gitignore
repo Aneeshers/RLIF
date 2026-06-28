@@ -3,3 +3,8 @@ __pycache__/
 __MACOSX/
 diag_ckpts/
 *.DS_Store
+*.pkl
+*.buggy_bak
+experts/
+wandb/
+*.npz
