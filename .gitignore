@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+__MACOSX/
+diag_ckpts/
+*.DS_Store

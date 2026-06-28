@@ -121,6 +121,15 @@ class SACLearner(Agent):
         pytree_node=False
     )  # See M in RedQ https://arxiv.org/abs/2101.05982
     backup_entropy: bool = struct.field(pytree_node=False)
+    # --- cosw (CAGE cosine-alignment) ---------------------------------------
+    # When cosw=True, the critic loss adds a per-state term
+    #   -cos( a_E - a_L , grad_a Qbar(s, a_L) )   (optionally * ||a_E - a_L||)
+    # computed at the learner mean action a_L, with a_E = expert mean action
+    # (supplied in batch["expert_actions"]). This is our validated CAGE cosw:
+    # it shapes the critic so its action-gradient points toward the expert.
+    cosw: bool = struct.field(pytree_node=False, default=False)
+    cosw_coef: float = struct.field(pytree_node=False, default=1.0)
+    cosw_weight_delta: bool = struct.field(pytree_node=False, default=True)
 
     @classmethod
     def create(
@@ -147,6 +156,9 @@ class SACLearner(Agent):
         preload_actor_params: Optional[dict] = None,
         preload_critic_params: Optional[dict] = None,
         preload_target_critic_params: Optional[dict] = None,
+        cosw: bool = False,
+        cosw_coef: float = 1.0,
+        cosw_weight_delta: bool = True,
     ):
         """
         An implementation of the version of Soft-Actor-Critic described in https://arxiv.org/abs/1812.05905
@@ -255,6 +267,9 @@ class SACLearner(Agent):
             num_qs=num_qs,
             num_min_qs=num_min_qs,
             backup_entropy=backup_entropy,
+            cosw=cosw,
+            cosw_coef=cosw_coef,
+            cosw_weight_delta=cosw_weight_delta,
         )
 
     def update_actor(self, batch: DatasetDict) -> Tuple[Agent, Dict[str, float]]:
@@ -337,6 +352,20 @@ class SACLearner(Agent):
 
         key, rng = jax.random.split(rng)
 
+        # cosw: precompute learner mean action a_L and the (detached) expert
+        # action a_E at the batch states. a_L is detached so the alignment term
+        # only shapes the critic (no actor double-grad), matching CAGE.
+        if self.cosw:
+            a_l = jax.lax.stop_gradient(
+                self.actor.apply_fn(
+                    {"params": self.actor.params}, batch["observations"]
+                ).mode()
+            )
+            a_e = jax.lax.stop_gradient(batch["expert_actions"])
+            delta = a_e - a_l
+            dn = jnp.linalg.norm(delta, axis=-1, keepdims=True)
+            delta_hat = delta / (dn + 1e-8)
+
         def critic_loss_fn(critic_params) -> Tuple[jnp.ndarray, Dict[str, float]]:
             qs = self.critic.apply_fn(
                 {"params": critic_params},
@@ -346,7 +375,33 @@ class SACLearner(Agent):
                 rngs={"dropout": key},
             )  # training=True
             critic_loss = ((qs - target_q) ** 2).mean()
-            return critic_loss, {"critic_loss": critic_loss, "q": qs.mean()}
+            info = {"critic_loss": critic_loss, "q": qs.mean()}
+
+            if self.cosw:
+                # grad_a of the mean Q (over the ensemble) at the learner action.
+                def qbar_sum(actions):
+                    qa = self.critic.apply_fn(
+                        {"params": critic_params},
+                        batch["observations"],
+                        actions,
+                        True,
+                        rngs={"dropout": key},
+                    )
+                    return qa.mean(axis=0).sum()
+
+                g = jax.grad(qbar_sum)(a_l)  # (B, act_dim)
+                cos = (delta_hat * g).sum(-1) / (
+                    jnp.linalg.norm(g, axis=-1) + 1e-8
+                )
+                per = -cos
+                if self.cosw_weight_delta:
+                    per = per * dn[:, 0]
+                cosw_loss = per.mean()
+                critic_loss = critic_loss + self.cosw_coef * cosw_loss
+                info["cosw_loss"] = cosw_loss
+                info["cosw_cos"] = cos.mean()
+
+            return critic_loss, info
 
         grads, info = jax.grad(critic_loss_fn, has_aux=True)(self.critic.params)
         critic = self.critic.apply_gradients(grads=grads)
